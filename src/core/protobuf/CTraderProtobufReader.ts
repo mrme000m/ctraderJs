@@ -25,7 +25,15 @@ export class CTraderProtobufReader {
         const Message = this.getMessageByPayloadType(payloadType);
         const message = Message.create(params);
 
-        return this.#wrap(payloadType, message, clientMsgId).encode();
+        // Create the envelope ProtoMessage and encode to a Buffer
+        const protoMessageObj = this.#wrap(payloadType, message, clientMsgId);
+        const ProtoMessage = this.getMessageByName("ProtoMessage");
+        const encoded = ProtoMessage.encode(protoMessageObj).finish();
+
+        // Return an object that matches the encoder's expectation (has `toBuffer()`)
+        return {
+            toBuffer: () => Buffer.from(encoded),
+        };
     }
 
     public decode(buffer: GenericObject): any {
@@ -41,16 +49,12 @@ export class CTraderProtobufReader {
     }
 
     #wrap(payloadType: number, message: any, clientMsgId: string): any {
-        const ProtoMessage = this.getMessageByName("ProtoMessage");
-
-        // Encode the inner message to a buffer
-        const payloadBuffer = message.constructor.encode(message).finish();
-
-        return ProtoMessage.create({
+        // Return a plain object that can be encoded by ProtoMessage.encode()
+        return {
             payloadType: payloadType,
-            payload: payloadBuffer,
+            payload: message.constructor.encode(message).finish(),
             clientMsgId: clientMsgId,
-        });
+        };
     }
 
     public load(): void {
@@ -61,25 +65,34 @@ export class CTraderProtobufReader {
     public build(): void {
         const root = this.#root;
 
-        // Process all nested objects
+        // Helper to recursively collect messages and enums from nested namespaces
         const messages: any[] = [];
         const enums: any[] = [];
 
-        for (const key in root.nested) {
-            const child = root.nested[key];
-            if (child instanceof protobuf.Type) {
-                messages.push(child);
-            } else if (child instanceof protobuf.Enum) {
-                enums.push(child);
+        function walk(node: any) {
+            if (!node) return;
+            for (const key in node.nested) {
+                const child = node.nested[key];
+                if (child instanceof protobuf.Type) {
+                    messages.push(child);
+                } else if (child instanceof protobuf.Enum) {
+                    enums.push(child);
+                } else if (child && typeof child === 'object' && child.nested) {
+                    walk(child);
+                }
             }
         }
 
+        walk(root);
+
         // Filter messages that have a payloadType field
-        messages.filter((message) => typeof this.findPayloadType(message) === "number")
+        messages.filter((message) => typeof this.findPayloadType(message) === 'number')
             .forEach((message) => {
                 const name: string = message.name;
-                // The message constructor is already available via root.nested[name]
-                const messageConstructor = root.nested[name];
+                // Find message constructor by traversing the root by name (handles nested containers)
+                const messageConstructor = this._findMessageConstructorByName(root, name);
+
+                if (!messageConstructor) return;
 
                 this.#messages[name] = messageConstructor;
 
@@ -98,10 +111,47 @@ export class CTraderProtobufReader {
         // Store enums
         enums.forEach((enumObj: any) => {
             const name: string = enumObj.name;
-            this.#enums[name] = root.nested[name];
+            const enumConstructor = this._findEnumConstructorByName(root, name);
+            if (enumConstructor) this.#enums[name] = enumConstructor;
         });
 
         this.#buildWrapper();
+
+        // Debug: list registered message names
+        if (process.env.CTRADER_DEBUG) {
+            console.log('[PROTO] Registered message names:', Object.keys(this.#names));
+            console.log('[PROTO] Registered payload types:', Object.keys(this.#payloadTypes));
+        }
+    }
+
+    // Helper: recursively search a message constructor by name
+    private _findMessageConstructorByName(root: any, name: string): any {
+        // Breadth-first search through nested namespaces
+        const queue = [root];
+        while (queue.length) {
+            const node = queue.shift();
+            if (!node || !node.nested) continue;
+            for (const key in node.nested) {
+                const child = node.nested[key];
+                if (child instanceof protobuf.Type && child.name === name) return child;
+                if (child && typeof child === 'object' && child.nested) queue.push(child);
+            }
+        }
+        return undefined;
+    }
+
+    private _findEnumConstructorByName(root: any, name: string): any {
+        const queue = [root];
+        while (queue.length) {
+            const node = queue.shift();
+            if (!node || !node.nested) continue;
+            for (const key in node.nested) {
+                const child = node.nested[key];
+                if (child instanceof protobuf.Enum && child.name === name) return child;
+                if (child && typeof child === 'object' && child.nested) queue.push(child);
+            }
+        }
+        return undefined;
     }
 
     #buildWrapper(): void {

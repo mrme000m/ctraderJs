@@ -10,6 +10,8 @@
         "noImplicitOverride": true,
         "outDir": "build",
         "paths": {
+            "@mrme000m/ctraderjs": ["./index.ts"],
+            "@mrme000m/ctraderjs/*": ["./*"],
             "!/*": [ "./*" ],
             "#*": [ "./src/core/*" ]
         },
@@ -24,6 +26,9 @@
         ".eslintrc.js",
         "jest.config.js",
         "**/*.ts"
+    ],
+    "plugins": [
+        { "transform": "typescript-transform-paths" }
     ],
     "exclude": [ "build", "node_modules" ]
 }

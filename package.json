@@ -1,5 +1,5 @@
 {
-    "name": "@reiryoku/ctrader-layer",
+    "name": "@mrme000m/ctraderjs",
     "version": "1.4.0",
     "type": "commonjs",
     "imports": {
@@ -13,9 +13,9 @@
     },
     "description": "A Node.js communication layer for the cTrader Open API.",
     "license": "MIT",
-    "homepage": "https://github.com/Reiryoku-Technologies/cTrader-Layer",
+    "homepage": "https://github.com/mrme000m/ctraderJs",
     "bugs": {
-        "url": "https://github.com/Reiryoku-Technologies/cTrader-Layer/issues"
+        "url": "https://github.com/mrme000m/ctraderJs/issues"
     },
     "author": {
         "name": "Vasile Pește / Reiryoku Technologies",
@@ -23,24 +23,32 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/Reiryoku-Technologies/cTrader-Layer.git"
+        "url": "https://github.com/mrme000m/ctraderJs.git"
     },
     "scripts": {
         "lint": "eslint . --ext .ts,.js",
         "build": "tsc",
+        "test": "npm run build && node ./build/src/tests/symbols.test.js",
         "safe-build": "rm -rf ./build && npm run lint && npm run build",
+        "prepare": "npm run safe-build",
         "prepublishOnly": "npm run safe-build"
     },
-    "main": "./build/entry/node/main.js",
-    "types": "./build/entry/node/main.d.ts",
+    "main": "./build/index.js",
+    "types": "./build/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./build/index.d.ts",
+            "default": "./build/index.js"
+        }
+    },
     "files": [
         "build",
-        "entry",
         "protobuf",
         "src"
     ],
     "dependencies": {
         "axios": "^1.7.9",
+        "dotenv": "^17.2.3",
         "protobufjs": "^8.0.0",
         "uuid": "^13.0.0",
         "ws": "^8.18.3"

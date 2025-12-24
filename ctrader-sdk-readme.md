@@ -60,15 +60,15 @@ A comprehensive, easy-to-use TypeScript/JavaScript client library for the [cTrad
 ## Installation
 
 ```bash
-npm install ctrader-open-api
+npm install @mrme000m/ctraderjs
 # or
-yarn add ctrader-open-api
+yarn add @mrme000m/ctraderjs
 ```
 
 ## Quick Start
 
 ```typescript
-import { CTraderClient } from 'ctrader-open-api';
+import { CTraderClient } from '@mrme000m/ctraderjs';
 
 const client = new CTraderClient({
   clientId: 'your_client_id',
@@ -347,9 +347,9 @@ Contributions welcome! Please see CONTRIBUTING.md
 
 ## Support
 
-- **Documentation**: https://github.com/yourusername/ctrader-open-api/docs
-- **Issues**: https://github.com/yourusername/ctrader-open-api/issues
-- **Discussions**: https://github.com/yourusername/ctrader-open-api/discussions
+- **Documentation**: https://github.com/mrme000m/ctraderJs/docs
+- **Issues**: https://github.com/mrme000m/ctraderJs/issues
+• **Discussions**: https://github.com/mrme000m/ctraderJs/discussions
 - **Discord**: Join our community server
 
 ## Disclaimer

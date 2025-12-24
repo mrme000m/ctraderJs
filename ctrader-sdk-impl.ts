@@ -309,65 +309,59 @@ interface PendingRequest {
 }
 
 class MessageHandler {
-  private pendingRequests = new Map<number, PendingRequest>();
-  private clientMsgId = 0;
   private onMessageCallback?: (message: any) => void;
-  private sender?: (payload: any) => void;
+  private sender?: (payload: any) => Promise<any>;
 
   setOnMessage(callback: (message: any) => void) {
     this.onMessageCallback = callback;
   }
 
-  setSender(fn: (payload: any) => void) {
+  setSender(fn: (payload: any) => Promise<any>) {
     this.sender = fn;
   }
 
-  sendMessage(payload: any, timeout: number = 5000): Promise<any> {
-    const clientMsgId = ++this.clientMsgId;
+  async sendMessage(payload: any, timeout: number = 5000): Promise<any> {
+    if (!this.sender) throw new NetworkError('No sender configured for MessageHandler');
+
+    const clientMsgId = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const payloadWithId = { ...payload, clientMsgId };
 
     return new Promise((resolve, reject) => {
       const timeoutHandle = setTimeout(() => {
-        this.pendingRequests.delete(clientMsgId);
         reject(new NetworkError(`Request timeout after ${timeout}ms`));
       }, timeout);
 
-      this.pendingRequests.set(clientMsgId, { resolve, reject, timeout: timeoutHandle });
-
-      // Serialize payload and send via configured sender
-      this.sendPayload({ ...payload, clientMsgId });
+      // Send via the configured sender which should return a Promise resolving to the response
+      this.sender!(payloadWithId).then((response) => {
+        clearTimeout(timeoutHandle);
+        // The server can return error payloads using `errorCode`/`description` (or `error`).
+        if (response && (response.error || response.errorCode || response.description)) {
+          const code = response.errorCode || response.error || 'UNKNOWN';
+          const message = response.description ?? response.error ?? JSON.stringify(response);
+          reject(new CTraderError(String(code), String(message)));
+        } else {
+          resolve(response);
+        }
+      }).catch((err) => {
+        clearTimeout(timeoutHandle);
+        // If the sender rejected with a structured CTraderError, forward it
+        if (err instanceof CTraderError) return reject(err);
+        // If the sender rejected with a server error payload, convert it to CTraderError
+        if (err && (err.errorCode || err.error || err.description)) {
+          const code = err.errorCode || err.error || 'UNKNOWN';
+          const message = err.description ?? err.error ?? JSON.stringify(err);
+          return reject(new CTraderError(String(code), String(message)));
+        }
+        reject(new NetworkError(String(err)));
+      });
     });
-  }
-
-  private sendPayload(payload: any) {
-    if (!this.sender) {
-      throw new NetworkError('No sender configured for MessageHandler');
-    }
-
-    try {
-      // In the simplified SDK we send JSON over WebSocket
-      this.sender(payload);
-    } catch (err) {
-      throw new NetworkError('Failed to send payload');
-    }
   }
 
   handleIncomingMessage(message: any) {
     if (this.onMessageCallback) {
       this.onMessageCallback(message);
     }
-
-    const clientMsgId = message.clientMsgId;
-    if (clientMsgId && this.pendingRequests.has(clientMsgId)) {
-      const { resolve, reject, timeout } = this.pendingRequests.get(clientMsgId)!;
-      this.pendingRequests.delete(clientMsgId);
-      clearTimeout(timeout);
-
-      if (message.error) {
-        reject(new CTraderError(message.errorCode || 'UNKNOWN', message.error));
-      } else {
-        resolve(message);
-      }
-    }
+    // Push messages are handled via `setOnMessage` and the CTraderConnection listeners that emit events
   }
 }
 
@@ -378,11 +372,18 @@ class MessageHandler {
 export class CTraderClient {
   private config: Required<CTraderConfig>;
   private ws?: WebSocket;
+  private connection?: any; // instance of src/core/CTraderConnection
   private messageHandler = new MessageHandler();
   private rateLimiter: RateLimiter;
   private reconnectAttempts = 0;
   private currentAccountId?: number;
   private connectionPromise?: Promise<void>;
+
+  // Symbol cache (short TTL to avoid repeated requests)
+  private symbolCache?: { ts: number; symbols: Symbol[] };
+
+  // Cache latest spot events by symbolId so callers can read immediately after subscribing
+  private lastSpotBySymbol = new Map<number, Spot>();
 
   // Event handlers
   private eventHandlers = new Map<string, Set<Function>>();
@@ -414,30 +415,14 @@ export class CTraderClient {
   }
 
   private setupMessageHandling() {
+    // Raw message hook for consumers
     this.messageHandler.setOnMessage((message) => {
       this.emit('raw-message', message);
-
-      // Route to appropriate handlers
-      if (message.spotEvent) this.emit('spot', message.spotEvent);
-      if (message.executionEvent) this.emit('execution', message.executionEvent);
-      if (message.orderError) this.emit('order-error', message.orderError);
-      if (message.marginChanged) this.emit('margin-changed', message.marginChanged);
-      if (message.trailingSLChanged) this.emit('trailing-sl-changed', message.trailingSLChanged);
-      if (message.depthEvent) this.emit('depth', message.depthEvent);
-      if (message.symbolChanged) this.emit('symbol-changed', message.symbolChanged);
-      if (message.traderUpdated) this.emit('trader-updated', message.traderUpdated);
-      if (message.marginCallTriggered) this.emit('margin-call', message.marginCallTriggered);
     });
 
-    // Configure MessageHandler to send via the active WebSocket
-    this.messageHandler.setSender((payload: any) => {
-      if (!this.ws) throw new NetworkError('Not connected');
-      // Send stringified JSON (simplified protocol for this SDK)
-      try {
-        this.ws.send(JSON.stringify(payload));
-      } catch (e) {
-        throw new NetworkError('Failed to send message over WebSocket');
-      }
+    // Default sender until a connection is established
+    this.messageHandler.setSender(async (payload: any) => {
+      throw new NetworkError('Not connected');
     });
   }
 
@@ -453,39 +438,80 @@ export class CTraderClient {
   }
 
   private async doConnect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      try {
-        const protocol = this.config.protocol === 'websocket' ? 'wss' : 'wss'; // SSL always
-        const url = `${protocol}://${this.config.host}:${this.config.port}`;
+    try {
+      // Use the protobuf-capable connection implementation
+      this.connection = new (require('./src/core/CTraderConnection').CTraderConnection)({ host: this.config.host, port: this.config.port });
 
-        this.ws = new WebSocket(url);
-        this.ws.binaryType = 'arraybuffer';
+      // Map a set of well-known push events from payload type -> friendly event name
+      const mappings: Array<{ names: string[]; event: string; fieldName?: string }> = [
+        { names: ['ProtoOASpotEvent'], event: 'spot', fieldName: 'spotEvent' },
+        { names: ['ProtoOAExecutionEvent'], event: 'execution', fieldName: 'executionEvent' },
+        { names: ['ProtoOAOrderError'], event: 'order-error', fieldName: 'orderError' },
+        { names: ['ProtoOAMarginChangedEvent'], event: 'margin-changed', fieldName: 'marginChanged' },
+        { names: ['ProtoOATrailingSLChangedEvent'], event: 'trailing-sl-changed', fieldName: 'trailingSLChanged' },
+        { names: ['ProtoOADepthEvent'], event: 'depth', fieldName: 'depthEvent' },
+        { names: ['ProtoOASymbolChangedEvent'], event: 'symbol-changed', fieldName: 'symbolChanged' },
+        { names: ['ProtoOATraderUpdatedEvent'], event: 'trader-updated', fieldName: 'traderUpdated' },
+        { names: ['ProtoOAMarginCallTriggeredEvent'], event: 'margin-call', fieldName: 'marginCallTriggered' }
+      ];
 
-        this.ws.onopen = () => {
-          this.reconnectAttempts = 0;
-          this.emit('connected');
-          resolve();
-        };
+      for (const mapEntry of mappings) {
+        for (const name of mapEntry.names) {
+          try {
+            const pt = this.connection.getPayloadTypeByName(name);
+            this.connection.on(pt.toString(), (payload: any) => {
+              // Normalize certain push events for DX (avoid Long/NaN issues)
+              let emitted = payload;
 
-        this.ws.onmessage = (event) => {
-          // Deserialize from protobuf in real implementation
-          const message = JSON.parse(event.data as string);
-          this.messageHandler.handleIncomingMessage(message);
-        };
+              if (mapEntry.event === 'spot') {
+                emitted = {
+                  symbolId: toNumber(payload.symbolId),
+                  symbol: payload.symbol || payload.name || payload.displayName || payload.instrumentName,
+                  bid: normalizePrice(payload.bid),
+                  ask: normalizePrice(payload.ask),
+                  bidVolume: toNumber(payload.bidVolume),
+                  askVolume: toNumber(payload.askVolume),
+                  timestamp: toNumber(payload.timestamp) || Date.now()
+                };
+              }
 
-        this.ws.onerror = (event) => {
-          this.emit('error', new NetworkError('WebSocket error'));
-          reject(new NetworkError('Failed to connect'));
-        };
+              this.emit(mapEntry.event, emitted);
 
-        this.ws.onclose = () => {
-          this.emit('disconnected');
-          this.handleDisconnection();
-        };
-      } catch (error) {
-        reject(error);
+              // Cache last spot per symbolId for immediate reads
+              if (mapEntry.event === 'spot' && typeof emitted?.symbolId === 'number') {
+                try { this.lastSpotBySymbol.set(emitted.symbolId, emitted); } catch (e) {}
+              }
+
+              // Mirror old raw message shape for backwards compatibility
+              const raw: any = {};
+              if (mapEntry.fieldName) raw[mapEntry.fieldName] = payload;
+              this.emit('raw-message', raw);
+            });
+            break;
+          } catch (e) {
+            // Try next candidate name
+          }
+        }
       }
-    });
+
+      // Bind sender to use the connection's sendCommand (returns decoded payload)
+      this.messageHandler.setSender(async (payload: any) => {
+        if (!this.connection) throw new NetworkError('Not connected');
+        const { type, clientMsgId, ...data } = payload;
+        // sendCommand will encode/decode protobufs and return the response payload
+        const response = await this.connection.sendCommand(type, data);
+        return response;
+      });
+
+      await this.connection.open();
+
+      this.reconnectAttempts = 0;
+      this.emit('connected');
+    } catch (error) {
+      this.emit('error', error instanceof Error ? error : new NetworkError(String(error)));
+      // Propagate error for connect() callers
+      throw error;
+    }
   }
 
   private handleDisconnection() {
@@ -501,12 +527,25 @@ export class CTraderClient {
   }
 
   async disconnect(): Promise<void> {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = undefined;
-      this.currentAccountId = undefined;
-      this.connectionPromise = undefined;
+    if (this.connection) {
+      try {
+        // Call close if available on the underlying connection (best-effort)
+        if (typeof (this.connection as any).close === 'function') {
+          await (this.connection as any).close();
+        }
+      } catch (_) {
+        // ignore
+      }
+      this.connection = undefined;
     }
+
+    if (this.ws) {
+      try { this.ws.close(); } catch (_) {}
+      this.ws = undefined;
+    }
+
+    this.currentAccountId = undefined;
+    this.connectionPromise = undefined;
   }
 
   async applicationAuth(): Promise<AuthTokens> {
@@ -569,11 +608,12 @@ export class CTraderClient {
   async getAccountsByToken(accessToken: string): Promise<AccountInfo[]> {
     return this.rateLimiter.executeRealTime(async () => {
       const response = await this.messageHandler.sendMessage({
-        type: 'ProtoOAGetAccountsReq',
+        type: 'ProtoOAGetAccountListByAccessTokenReq',
         accessToken
       }, this.config.timeout);
 
-      return response.accounts || [];
+      // The server returns `ctidTraderAccount` array in the response
+      return response.ctidTraderAccount || [];
     });
   }
 
@@ -624,20 +664,32 @@ export class CTraderClient {
         ctidTraderAccountId: this.currentAccountId
       }, this.config.timeout);
 
+      if (process.env.CTRADER_DEBUG) {
+        try {
+          console.log('[DEBUG] getAccountInfo raw response:', JSON.stringify(response, Object.getOwnPropertyNames(response), 2));
+        } catch (e) {
+          console.log('[DEBUG] getAccountInfo raw response (inspect):', response);
+        }
+      }
+
+      // Some cTrader responses nest account values under `trader` (ProtoOATraderRes).
+      const t: any = response.trader ?? response;
+      const moneyDigits = toNumber(t.moneyDigits ?? 2);
+
       return {
-        ctidTraderAccountId: response.ctidTraderAccountId,
-        balance: normalizePrice(response.balance),
-        equity: normalizePrice(response.equity),
-        unrealizedPnl: normalizePrice(response.unrealizedPnl),
-        marginLevel: response.marginLevel,
-        usedMargin: normalizePrice(response.usedMargin),
-        availableMargin: normalizePrice(response.availableMargin),
-        marginRequired: normalizePrice(response.marginRequired),
-        leverage: response.leverage,
-        currency: response.currency,
-        accountType: response.accountType,
-        limitedRisk: response.limitedRisk || false
-      };
+        ctidTraderAccountId: toNumber(response.ctidTraderAccountId),
+        balance: normalizeMoney(t.balance ?? t.availableBalance ?? 0, moneyDigits),
+        equity: normalizeMoney(t.equity ?? 0, moneyDigits),
+        unrealizedPnl: normalizeMoney(t.unrealizedPnl ?? 0, moneyDigits),
+        marginLevel: toNumber(t.marginLevel ?? response.marginLevel),
+        usedMargin: normalizeMoney(t.usedMargin ?? 0, moneyDigits),
+        availableMargin: normalizeMoney(t.availableMargin ?? 0, moneyDigits),
+        marginRequired: normalizeMoney(t.marginRequired ?? 0, moneyDigits),
+        leverage: t.leverageInCents ? toNumber(t.leverageInCents) / 100 : toNumber(t.leverage),
+        currency: t.currency ?? response.currency,
+        accountType: typeof t.accountType === 'string' ? t.accountType : (t.accountType ? String(t.accountType) : response.accountType),
+        limitedRisk: Boolean(t.isLimitedRisk ?? t.limitedRisk ?? response.limitedRisk)
+      }; 
     });
   }
 
@@ -701,14 +753,25 @@ export class CTraderClient {
   // MARKET DATA & SYMBOLS
   // ========================================================================
 
-  async getAllSymbols(): Promise<Symbol[]> {
+  async getAllSymbols(forceRefresh: boolean = false): Promise<Symbol[]> {
     return this.rateLimiter.executeHistorical(async () => {
+      this.ensureAuthenticated();
+
+      const now = Date.now();
+      if (!forceRefresh && this.symbolCache && (now - this.symbolCache.ts) < 60_000) {
+        return this.symbolCache.symbols;
+      }
+
       const response = await this.messageHandler.sendMessage({
         type: 'ProtoOASymbolsListReq',
+        ctidTraderAccountId: this.currentAccountId,
         includeArchivedSymbols: false
       }, this.config.timeout);
 
-      return response.symbols || [];
+      const symbols = response.symbol || response.symbols || [];
+      // Cache for a short while
+      this.symbolCache = { ts: now, symbols };
+      return symbols;
     });
   }
 
@@ -753,47 +816,413 @@ export class CTraderClient {
     });
   }
 
-  async subscribeToSymbols(symbols: string[]): Promise<void> {
-    return this.rateLimiter.executeRealTime(async () => {
-      const response = await this.messageHandler.sendMessage({
-        type: 'ProtoOASubscribeSpotsReq',
-        ctidTraderAccountId: this.currentAccountId,
-        symbols
-      }, this.config.timeout);
+  // Helper: normalize a symbol string (remove separators, trailing single-letter forward marker, numeric suffixes)
+  private normalizeSymbolString(s: string): string {
+    if (!s) return '';
+    let t = String(s).toUpperCase().trim();
+    // Remove common separators
+    t = t.replace(/[\s\/\._-]+/g, '');
+    // If symbol ends with a trailing 'F' (forward) remove it (XAUUSD-F -> XAUUSD)
+    if (/F$/.test(t)) t = t.replace(/F$/, '');
+    // Remove short numeric suffixes that are often contract markers (-24, -12)
+    t = t.replace(/\d{1,2}$/, '');
+    // Strip any remaining non-alphanumeric
+    t = t.replace(/[^A-Z0-9]/g, '');
+    return t;
+  }
 
-      if (response.error) throw new CTraderError('SUBSCRIBE_ERROR', response.error);
+  // Helper: build normalized forms for a proto symbol entry
+  private buildSymbolNormals(sym: any) {
+    const rawName = String(sym.symbolName ?? sym.name ?? sym.displayName ?? '');
+    const desc = String(sym.description ?? '');
+    return {
+      nameRaw: rawName,
+      descRaw: desc,
+      nameNorm: this.normalizeSymbolString(rawName),
+      descNorm: this.normalizeSymbolString(desc),
+      combinedNorm: this.normalizeSymbolString(rawName + desc)
+    };
+  }
+
+  // Lightweight Levenshtein distance (small inputs; used sparingly)
+  private levenshtein(a: string, b: string): number {
+    if (!a || !b) return Math.max(a?.length || 0, b?.length || 0);
+    const m = a.length, n = b.length;
+    const dp: number[] = Array(n + 1).fill(0).map((_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      let prev = dp[0];
+      dp[0] = i;
+      for (let j = 1; j <= n; j++) {
+        const cur = dp[j];
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
+        prev = cur;
+      }
+    }
+    return dp[n];
+  }
+
+  // Map of common currency codes to name synonyms (used to match descriptions)
+  private currencyNameMap: Record<string, string[]> = {
+    USD: ['US DOLLAR', 'USD', 'DOLLAR', 'AMERICAN DOLLAR'],
+    EUR: ['EURO', 'EUR', 'EUROPEAN CURRENCY'],
+    GBP: ['BRITISH POUND', 'POUND', 'GBP', 'STERLING'],
+    JPY: ['JAPANESE YEN', 'YEN', 'JPY'],
+    AUD: ['AUSTRALIAN DOLLAR', 'AUD'],
+    CAD: ['CANADIAN DOLLAR', 'CAD'],
+    CHF: ['SWISS FRANC', 'CHF', 'FRANC'],
+    NZD: ['NEW ZEALAND DOLLAR', 'NZD'],
+    MXN: ['MEXICAN PESO', 'MXN', 'PESO'],
+    ZAR: ['SOUTH AFRICAN RAND', 'ZAR', 'RAND'],
+    CNY: ['CHINESE YUAN', 'RENMINBI', 'RMB', 'CNY', 'YUAN'],
+    CNH: ['CHINESE YUAN', 'CNH', 'RMB', 'YUAN'],
+    SEK: ['SWEDISH KRONA', 'SEK', 'KRONA'],
+    NOK: ['NORWEGIAN KRONE', 'NOK', 'KRONE'],
+    DKK: ['DANISH KRONE', 'DKK', 'KRONE'],
+    PLN: ['POLISH ZLOTY', 'PLN', 'ZLOTY'],
+    SGD: ['SINGAPORE DOLLAR', 'SGD'],
+    HKD: ['HONG KONG DOLLAR', 'HKD'],
+    RUB: ['RUSSIAN RUBLE', 'RUBLE', 'RUB'],
+    BRL: ['BRAZILIAN REAL', 'REAL', 'BRL'],
+    TRY: ['TURKISH LIRA', 'LIRA', 'TRY'],
+    INR: ['INDIAN RUPEE', 'RUPEE', 'INR']
+  };
+
+  private matchByDescriptionTokens(lookupNorm: string, list: any[]): any | null {
+    if (!lookupNorm) return null;
+    // Find which currency codes or their synonyms appear inside the lookup string
+    const codesFound: string[] = [];
+    const keyList = Object.keys(this.currencyNameMap);
+    for (const c of keyList) {
+      const synonyms = this.currencyNameMap[c] || [];
+      const synNorms = synonyms.map((s) => this.normalizeSymbolString(s));
+      const has = lookupNorm.includes(c) || synNorms.some(sn => lookupNorm.includes(sn));
+      if (has) codesFound.push(c);
+    }
+
+    // Need at least two currency codes (FX pair) to use description matching
+    if (codesFound.length < 2) return null;
+
+    // Attempt pairs (base,quote) and reversed
+    for (let i = 0; i < codesFound.length; i++) {
+      for (let j = 0; j < codesFound.length; j++) {
+        if (i === j) continue;
+        const base = codesFound[i];
+        const quote = codesFound[j];
+
+        // For each symbol, check description contains synonyms for both currencies (order-agnostic)
+        const found = list.find((sym: any) => {
+          const desc = String(sym.description ?? sym.name ?? '').toUpperCase();
+          const baseOk = this.currencyNameMap[base].some(s => desc.includes(s));
+          const quoteOk = this.currencyNameMap[quote].some(s => desc.includes(s));
+          return baseOk && quoteOk;
+        });
+
+        if (found) return found;
+      }
+    }
+
+    return null;
+  }
+
+  private async strictResolveSymbolId(input: string): Promise<number> {
+    const name = String(input || '').trim();
+    const lookupNorm = this.normalizeSymbolString(name);
+
+    const list = await this.getAllSymbols();
+
+    // 1) Exact normalized symbol name
+    let matched = list.find((sym: any) => this.buildSymbolNormals(sym).nameNorm === lookupNorm);
+
+    // 2) Exact normalized description
+    if (!matched) matched = list.find((sym: any) => this.buildSymbolNormals(sym).descNorm === lookupNorm);
+
+    // 3) Combined name+desc contains the lookup
+    if (!matched) matched = list.find((sym: any) => this.buildSymbolNormals(sym).combinedNorm.includes(lookupNorm));
+
+    // 4) Description-based currency token matching
+    if (!matched) {
+      const descMatch = this.matchByDescriptionTokens(lookupNorm, list);
+      if (descMatch) matched = descMatch;
+    }
+
+    if (matched) return toNumber((matched as any).symbolId);
+
+    // If still no match, throw with candidates
+    const nameNorm = lookupNorm;
+    const candidates = list
+      .map((s: any) => ({
+        id: toNumber(s.symbolId),
+        label: String(s.symbolName ?? s.name ?? s.displayName ?? s.description ?? '').trim(),
+        norm: this.normalizeSymbolString(String(s.symbolName ?? s.name ?? s.displayName ?? s.description ?? ''))
+      }))
+      .map((c: any) => ({ ...c, dist: this.levenshtein(c.norm, nameNorm) }))
+      .sort((a: any, b: any) => a.dist - b.dist)
+      .slice(0, 5)
+      .map((c: any) => `${c.label} (id ${c.id})`);
+
+    const suggestion = candidates.length ? `; candidates: ${candidates.join(', ')}` : '';
+    throw new CTraderError('SYMBOL_NOT_FOUND', `Symbol not found: ${name}${suggestion}`);
+  }
+
+  private async resolveSymbolIds(inputs: Array<string | number>): Promise<number[]> {
+    // Normalize inputs
+    const wants: Array<string | number> = (inputs || []).map((s) => (typeof s === 'string' ? s.trim() : s));
+    const ids: number[] = [];
+    const unresolved: string[] = [];
+
+    // First pass: direct numbers
+    for (const s of wants) {
+      if (typeof s === 'number' && Number.isFinite(s)) {
+        ids.push(s);
+      } else if (typeof s === 'string' && /^[0-9]+$/.test(s)) {
+        ids.push(Number(s));
+      } else if (typeof s === 'string') {
+        unresolved.push(s);
+      }
+    }
+
+    if (unresolved.length === 0) return ids;
+
+    // Fetch symbol list (cached)
+    const list = await this.getAllSymbols();
+
+    for (const name of unresolved) {
+      const lookupNorm = this.normalizeSymbolString(name);
+      let matched: any = null;
+
+      // 1) Exact normalized symbol name
+      matched = list.find((sym: any) => this.buildSymbolNormals(sym).nameNorm === lookupNorm);
+
+      // 2) Exact normalized description
+      if (!matched) matched = list.find((sym: any) => this.buildSymbolNormals(sym).descNorm === lookupNorm);
+
+      // 3) Combined name+desc contains the lookup
+      if (!matched) matched = list.find((sym: any) => this.buildSymbolNormals(sym).combinedNorm.includes(lookupNorm));
+
+          // 4) Try matching by description tokens (currency names)
+      if (!matched) {
+        const descMatch = this.matchByDescriptionTokens(lookupNorm, list);
+        if (descMatch) matched = descMatch;
+      }
+
+      // 5) Fallback: relaxed substring match on raw uppercase text
+      if (!matched) {
+        const rawLookup = String(name).toUpperCase().replace(/[^A-Z0-9]/g, '');
+        matched = list.find((sym: any) => {
+          const rawName = String(sym.symbolName ?? sym.name ?? sym.displayName ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const desc = String(sym.description ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          return rawName.includes(rawLookup) || desc.includes(rawLookup) || (rawName + desc).includes(rawLookup);
+        });
+      }
+
+      // 6) Tiny fuzzy fallback: allow distance 1 (to catch small typos)
+      if (!matched) {
+        matched = list.find((sym: any) => {
+          const n = this.buildSymbolNormals(sym).nameNorm;
+          return n && this.levenshtein(n, lookupNorm) <= 1;
+        });
+      }
+
+      if (matched) {
+        if (process.env.CTRADER_DEBUG) console.log(`[DEBUG] resolveSymbolIds matched ${name} -> ${String(matched.symbolName ?? matched.name ?? matched.displayName ?? matched.description ?? '')} (id: ${toNumber(matched.symbolId)})`);
+        ids.push(toNumber((matched as any).symbolId));
+      } else {
+        // Build helpful suggestions for operator
+        const nameNorm = this.normalizeSymbolString(String(name));
+        const candidates = list
+          .map((s: any) => ({
+            id: toNumber(s.symbolId),
+            label: String(s.symbolName ?? s.name ?? s.displayName ?? s.description ?? '').trim(),
+            norm: this.normalizeSymbolString(String(s.symbolName ?? s.name ?? s.displayName ?? s.description ?? ''))
+          }))
+          .map((c: any) => ({ ...c, dist: this.levenshtein(c.norm, nameNorm) }))
+          .sort((a: any, b: any) => a.dist - b.dist)
+          .slice(0, 5)
+          .map((c: any) => `${c.label} (id ${c.id})`);
+
+        if (process.env.CTRADER_DEBUG) console.log(`[DEBUG] resolveSymbolIds failed for ${name}; closest: ${candidates.join(', ')}`);
+
+        const suggestion = candidates.length ? `; candidates: ${candidates.join(', ')}` : '';
+        throw new CTraderError('SYMBOL_NOT_FOUND', `Symbol not found: ${name}${suggestion}`);
+      }
+    }
+
+    return ids;
+  }
+
+  /**
+   * Public helper: return symbolId for a given symbol name or undefined
+   */
+  async getSymbolIdByName(name: string): Promise<number | undefined> {
+    const ids = await this.resolveSymbolIds([name]);
+    return ids[0];
+  }
+
+  async subscribeToSymbols(symbols: Array<string | number>, maxRetries: number = 3): Promise<number[]> {
+    return this.rateLimiter.executeRealTime(async () => {
+      this.ensureAuthenticated();
+
+      const symbolIds = await this.resolveSymbolIds(symbols);
+
+      if (!symbolIds || symbolIds.length === 0) throw new CTraderError('SUBSCRIBE_ERROR', 'No symbols could be resolved to ids');
+
+      let attempt = 0;
+      while (true) {
+        try {
+          const response = await this.messageHandler.sendMessage({
+            type: 'ProtoOASubscribeSpotsReq',
+            ctidTraderAccountId: this.currentAccountId,
+            symbolId: symbolIds,
+            subscribeToSpotTimestamp: true
+          }, this.config.timeout);
+
+          if (response.error) throw new CTraderError('SUBSCRIBE_ERROR', response.error);
+          return symbolIds;
+        } catch (err: any) {
+          attempt++;
+          // Do not retry authorization errors
+          if (err instanceof CTraderError && err.code === 'INVALID_REQUEST' && /authorized/i.test(err.message)) {
+            throw err;
+          }
+
+          if (attempt >= maxRetries) {
+            throw err;
+          }
+
+          // Retry on transient error or empty-symbols message
+          if (err instanceof CTraderError && /empty symbols list/i.test(String(err.message))) {
+            const delay = 200 * Math.pow(2, attempt - 1);
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
+
+          // For any other error, don't suppress yet, but retry after short backoff once
+          const delay = 100 * Math.pow(2, attempt - 1);
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
     });
   }
 
-  async unsubscribeFromSymbols(symbols: string[]): Promise<void> {
+  async unsubscribeFromSymbols(symbols: Array<string | number>, maxRetries: number = 3): Promise<void> {
     return this.rateLimiter.executeRealTime(async () => {
-      const response = await this.messageHandler.sendMessage({
-        type: 'ProtoOAUnsubscribeSpotsReq',
-        ctidTraderAccountId: this.currentAccountId,
-        symbols
-      }, this.config.timeout);
+      this.ensureAuthenticated();
 
-      if (response.error) throw new CTraderError('UNSUBSCRIBE_ERROR', response.error);
+      const symbolIds = await this.resolveSymbolIds(symbols);
+
+      if (!symbolIds || symbolIds.length === 0) throw new CTraderError('UNSUBSCRIBE_ERROR', 'No symbols could be resolved to ids');
+
+      let attempt = 0;
+      while (true) {
+        try {
+          const response = await this.messageHandler.sendMessage({
+            type: 'ProtoOAUnsubscribeSpotsReq',
+            ctidTraderAccountId: this.currentAccountId,
+            symbolId: symbolIds
+          }, this.config.timeout);
+
+          if (response.error) throw new CTraderError('UNSUBSCRIBE_ERROR', response.error);
+          return;
+        } catch (err: any) {
+          attempt++;
+          if (attempt >= maxRetries) throw err;
+          await new Promise((r) => setTimeout(r, 100 * Math.pow(2, attempt - 1)));
+        }
+      }
     });
   }
 
   async getCurrentPrice(symbol: string): Promise<Spot> {
     return this.rateLimiter.executeRealTime(async () => {
-      const response = await this.messageHandler.sendMessage({
-        type: 'ProtoOASpotReq',
-        ctidTraderAccountId: this.currentAccountId,
-        symbol
-      }, this.config.timeout);
+      // Must be authenticated to subscribe to spot events
+      this.ensureAuthenticated();
 
-      return {
-        symbolId: response.symbolId,
-        symbol: response.symbol,
-        bid: normalizePrice(response.bid),
-        ask: normalizePrice(response.ask),
-        bidVolume: response.bidVolume,
-        askVolume: response.askVolume,
-        timestamp: response.timestamp
-      };
+      const timeoutMs = this.config.timeout;
+
+      return new Promise<Spot>(async (resolve, reject) => {
+        let settled = false;
+
+        let handler: any = null;
+
+        let timer: NodeJS.Timeout | null = null;
+        const cleanup = async () => {
+          try { if (handler) this.off('spot', handler); } catch (e) {}
+          try { await this.unsubscribeFromSymbols([symbol]); } catch (e) {}
+          if (timer) clearTimeout(timer);
+        };
+
+        // Resolve name to symbolId for matching server events (strict match to avoid false positives)
+        let resolvedId: number | null = null;
+        try {
+          const id = await this.strictResolveSymbolId(symbol);
+          resolvedId = id;
+        } catch (e: any) {
+          // If the symbol cannot be resolved strictly, surface the error immediately instead of attempting a blind subscribe
+          if (e instanceof CTraderError && e.code === 'SYMBOL_NOT_FOUND') {
+            settled = true;
+            cleanup();
+            reject(e);
+            return;
+          }
+          resolvedId = null;
+        }
+
+        // (Try subscribe; this may reject if account not authorized)
+        try {
+          const ids = await this.subscribeToSymbols([symbol]);
+          const sid = ids && ids.length ? ids[0] : null;
+
+          // If we already have a cached spot for this symbolId (the server may have pushed it while subscribing), return it immediately
+          if (sid !== null) {
+            const last = this.lastSpotBySymbol.get(sid);
+            if (last && !settled) {
+              settled = true;
+              cleanup();
+              return resolve(last);
+            }
+          }
+
+          // Listen for spot events after we've subscribed & checked recent cache
+          handler = (s: any) => {
+            if (process.env.CTRADER_DEBUG) console.log('[DEBUG] getCurrentPrice handler saw spot:', s);
+            const sidNow = toNumber(s?.symbolId, NaN);
+            const matches = sid !== null ? (sidNow === sid) : (String(s?.symbol || '').toUpperCase() === String(symbol).toUpperCase());
+
+            if (matches && !settled) {
+              if (process.env.CTRADER_DEBUG) console.log('[DEBUG] getCurrentPrice matched spot for', symbol, 'sid', sid, 'sidNow', sidNow);
+              settled = true;
+              cleanup();
+              resolve({
+                symbolId: toNumber(s.symbolId),
+                symbol: s.symbol || undefined,
+                bid: normalizePrice(s.bid),
+                ask: normalizePrice(s.ask),
+                bidVolume: toNumber(s.bidVolume),
+                askVolume: toNumber(s.askVolume),
+                timestamp: toNumber(s.timestamp) || Date.now()
+              });
+            }
+          };
+
+          this.on('spot', handler);
+
+          // Start timeout AFTER we've subscribed and attached the handler so we wait a full timeoutMs for the first push
+          timer = setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              cleanup();
+              reject(new NetworkError(`Timeout waiting for spot for ${symbol}`));
+            }
+          }, timeoutMs);
+        } catch (err) {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(err);
+          }
+        }
+      });
     });
   }
 
@@ -1425,10 +1854,47 @@ export class CTraderClient {
 // ============================================================================
 
 /**
+ * Coerce a Long-like / string / bigint value into a JS Number when safe.
+ * Falls back to `fallback` when conversion is not possible.
+ */
+export function toNumber(value: any, fallback: number = 0): number {
+  if (value == null) return fallback;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'bigint') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  if (typeof value === 'string') {
+    const n = parseFloat(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  if (typeof value === 'object') {
+    try {
+      if (typeof (value as any).toNumber === 'function') {
+        const n = (value as any).toNumber();
+        return Number.isFinite(n) ? n : fallback;
+      }
+      const str = (value as any).toString?.();
+      if (typeof str === 'string') {
+        const n = parseFloat(str);
+        return Number.isFinite(n) ? n : fallback;
+      }
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  return fallback;
+}
+
+/**
  * Convert price from protocol format (1/100000) to decimal
  */
-export function normalizePrice(value: number, digits: number = 5): number {
-  return value / Math.pow(10, digits);
+export function normalizePrice(value: any, digits: number = 5): number {
+  const n = toNumber(value, NaN);
+  if (Number.isNaN(n)) return NaN;
+  return n / Math.pow(10, digits);
 }
 
 /**
@@ -1441,8 +1907,10 @@ export function denormalizePrice(value: number, digits: number = 5): number {
 /**
  * Convert volume from protocol format (cents) to standard lots
  */
-export function normalizeVolume(value: number): number {
-  return value / 100;
+export function normalizeVolume(value: any): number {
+  const n = toNumber(value, NaN);
+  if (Number.isNaN(n)) return NaN;
+  return n / 100;
 }
 
 /**
@@ -1455,8 +1923,10 @@ export function denormalizeVolume(value: number): number {
 /**
  * Handle money normalization with exponent
  */
-export function normalizeMoney(value: number, exponent: number = 2): number {
-  return value / Math.pow(10, exponent);
+export function normalizeMoney(value: any, exponent: number = 2): number {
+  const n = toNumber(value, NaN);
+  if (Number.isNaN(n)) return NaN;
+  return n / Math.pow(10, exponent);
 }
 
 /**

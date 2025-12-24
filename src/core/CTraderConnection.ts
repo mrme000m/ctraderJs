@@ -25,10 +25,15 @@ export class CTraderConnection extends EventEmitter {
         this.#commandMap = new CTraderCommandMap({ send: (data: any): void => this.#send(data), });
         this.#encoderDecoder = new CTraderEncoderDecoder();
         // eslint-disable-next-line max-len
+        // Load .proto files from the repository root protobuf/ directory so runtime can use the authoritative message set
         this.#protobufReader = new CTraderProtobufReader([ {
-            file: path.resolve(__dirname, "../../protobuf/OpenApiCommonMessages.proto"),
+            file: path.resolve(__dirname, "../../../protobuf/OpenApiCommonMessages.proto"),
         }, {
-            file: path.resolve(__dirname, "../../protobuf/OpenApiMessages.proto"),
+            file: path.resolve(__dirname, "../../../protobuf/OpenApiMessages.proto"),
+        }, {
+            file: path.resolve(__dirname, "../../../protobuf/OpenApiCommonModelMessages.proto"),
+        }, {
+            file: path.resolve(__dirname, "../../../protobuf/OpenApiModelMessages.proto"),
         }, ]);
         this.#socket = new CTraderSocket({ host, port, });
         this.#resolveConnectionPromise = undefined;
