@@ -1,0 +1,61 @@
+{
+    "name": "@reiryoku/ctrader-layer",
+    "version": "1.4.0",
+    "type": "commonjs",
+    "imports": {
+        "#commands/*": "./src/core/commands/*.ts",
+        "#encoder-decoder/*": "./src/core/encoder-decoder/*.ts",
+        "#sockets/*": "./src/core/sockets/*.ts",
+        "#utilities/*": "./src/core/utilities/*.ts",
+        "#protobuf/*": "./src/core/protobuf/*.ts",
+        "#auth/*": "./src/core/auth/*.ts",
+        "#CTraderConnectionParameters": "./src/core/CTraderConnectionParameters.ts"
+    },
+    "description": "A Node.js communication layer for the cTrader Open API.",
+    "license": "MIT",
+    "homepage": "https://github.com/Reiryoku-Technologies/cTrader-Layer",
+    "bugs": {
+        "url": "https://github.com/Reiryoku-Technologies/cTrader-Layer/issues"
+    },
+    "author": {
+        "name": "Vasile Pește / Reiryoku Technologies",
+        "email": "vasile.peste@protonmail.ch"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Reiryoku-Technologies/cTrader-Layer.git"
+    },
+    "scripts": {
+        "lint": "eslint . --ext .ts,.js",
+        "build": "tsc",
+        "safe-build": "rm -rf ./build && npm run lint && npm run build",
+        "prepublishOnly": "npm run safe-build"
+    },
+    "main": "./build/entry/node/main.js",
+    "types": "./build/entry/node/main.d.ts",
+    "files": [
+        "build",
+        "entry",
+        "protobuf",
+        "src"
+    ],
+    "dependencies": {
+        "axios": "^1.7.9",
+        "protobufjs": "^8.0.0",
+        "uuid": "^13.0.0",
+        "ws": "^8.18.3"
+    },
+    "devDependencies": {
+        "@reiryoku/eslint-config-reiryoku": "^3.0.0",
+        "@types/node": "^22.15.18",
+        "@types/uuid": "^10.0.0",
+        "@types/ws": "^8.18.1",
+        "@typescript-eslint/eslint-plugin": "^8.25.0",
+        "@typescript-eslint/parser": "^8.25.0",
+        "eslint": "^9.25.1",
+        "ttypescript": "^1.5.15",
+        "typescript": "^5.9.3",
+        "typescript-eslint": "^8.50.1",
+        "typescript-transform-paths": "^3.5.5"
+    }
+}

@@ -1,0 +1,29 @@
+{
+    "compilerOptions": {
+        "baseUrl": ".",
+        "declaration": true,
+        "incremental": true,
+        "inlineSources": true,
+        "module": "CommonJS",
+        "moduleResolution": "Node",
+        "noImplicitReturns": true,
+        "noImplicitOverride": true,
+        "outDir": "build",
+        "paths": {
+            "!/*": [ "./*" ],
+            "#*": [ "./src/core/*" ]
+        },
+        "removeComments": true,
+        "sourceMap": true,
+        "strict": true,
+        "target": "es6",
+        "types": ["node"],
+        "skipLibCheck": true
+    },
+    "include": [
+        ".eslintrc.js",
+        "jest.config.js",
+        "**/*.ts"
+    ],
+    "exclude": [ "build", "node_modules" ]
+}
